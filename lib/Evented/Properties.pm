@@ -16,9 +16,9 @@ use 5.010;
 
 use Carp;
 use Scalar::Util 'blessed';
+use Evented::Object;
 
-our $VERSION = 0.2;
-our %p;       # %p = package options
+our $VERSION = 0.3;
 
 # Evented::Properties import subroutine.
 sub import {
@@ -26,7 +26,8 @@ sub import {
     my $package = caller;
     
     # store Evented::Properties options.
-    $p{$package}{desired} = \@opts;
+    my $store = Evented::Object::_package_store($package)->{EventedProperties} ||= {};
+    $store->{desired} = \@opts;
     
     # determine properties.
     my (%props, $last_thing);
@@ -118,7 +119,8 @@ sub add_property {
     });
 
     # store property info.
-    $p{$package}{properties}{$property} = \%opts;
+    my $store = Evented::Object::_package_store($package)->{EventedProperties} ||= {};
+    $store->{properties}{$property} = \%opts;
     
     return 1;
 }
