@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2013, Mitchell Cooper
+# Copyright (c) 2014, Mitchell Cooper
 #
 # Evented::Properties: object property getters and setters for Evented::Object
 #
@@ -13,12 +13,16 @@ use warnings;
 use strict;
 use utf8;
 use 5.010;
+use parent 'Tie::Scalar';
 
 use Carp;
-use Scalar::Util 'blessed';
-use Evented::Object;
+use Scalar::Util qw(weaken blessed);
 
-our $VERSION = 0.3;
+use Evented::Object;
+use Evented::Object::Hax 'export_code';
+
+our $VERSION = '0.40';
+our $props   = $Evented::Object::props;
 
 # Evented::Properties import subroutine.
 sub import {
@@ -26,7 +30,7 @@ sub import {
     my $package = caller;
     
     # store Evented::Properties options.
-    my $store = Evented::Object::_package_store($package)->{EventedProperties} ||= {};
+    my $store = _prop_store($class);
     $store->{desired} = \@opts;
     
     # determine properties.
@@ -43,86 +47,95 @@ sub import {
     return 1;
 }
 
-# export a subroutine.
-# export_code('My::Package', 'my_sub', \&_my_sub)
-sub export_code {
-    my ($package, $sub_name, $code) = @_;
-    no strict 'refs';
-    *{"${package}::$sub_name"} = $code;
-}
+# fetch the Evented::Properties section of a package store.
+sub _prop_store { Evented::Object::_package_store(shift)->{EventedProperties} ||= {} }
 
-# safely fire an event.
-sub safe_fire {
-    my $obj = shift;
-    return if !blessed $obj || !$obj->isa('Evented::Object');
-    return $obj->fire_event(@_);
+# called by the anonymous lvalue subroutines.
+sub get_lvalue : lvalue {
+    my ($property, $eo) = @_;
+    add_default_set_callback($eo);
+    my $r = \($eo->{$props}{eventedProperties}{properties}{$property} //= undef);
+    tie $$r, __PACKAGE__, $property, $eo if not tied $$r;
+    return $$r;
 }
-
-# %opts = (
-#     readonly => undef or 1,
-#     getter   => CODE or 'default',
-#     setter   => CODE or sub { return } if readonly or 'default'
-# )
 
 # adds a property to a package.
 sub add_property {
     my ($package, $property, %opts) = @_;
-    
-    # determine the getter.
-    if (defined $opts{getter} and !ref $opts{getter} || ref $opts{getter} ne 'CODE') {
-        carp "Evented property '$property' for '$package' provided a non-code getter.";
-        return;
-    }
-    
-    # default getter.
-    elsif (!defined $opts{getter}) {
-        $opts{getter} = sub {
-            my $obj = shift;
-            return $obj->{$property};
-        };
-    }
 
-    # determine the setter.
-    if (defined $opts{setter} and !ref $opts{setter} || ref $opts{setter} ne 'CODE') {
-        carp "Evented property '$property' for '$package' provided a non-code setter.";
-        return;
-    }
+    # export the code with the lvalue attribute.
+    export_code($package, $property, sub : lvalue { get_lvalue($property, @_) });
+    attributes::->import($package, $package->can($property), 'lvalue');
     
-    # default setter.
-    elsif (!defined $opts{setter}) {
-        $opts{setter} = sub {
-            my ($obj, $val) = @_;
-            $obj->{$property} = $val;
-        }
-    }
-    
-    # for readonly properties, return undef on setters.
-    if ($opts{readonly}) {
-        $opts{setter} = sub {
-            carp "Setter called on readonly evented property '$property' for '$package'";
-            return;
-        };
-    }
-
-    # export getter.
-    export_code($package, $property, sub {
-        my $obj = @_;
-        safe_fire($obj, "get_$property"); # XXX: when would this be useful?
-        $opts{getter}(@_);
-    });
-    
-    # export setter.
-    export_code($package, "set_$property", sub {
-        my ($obj, $new) = @_;
-        safe_fire($obj, "set_$property" => $obj->can($property) ? $obj->$property : undef, $new);
-        $opts{setter}(@_);
-    });
-
     # store property info.
-    my $store = Evented::Object::_package_store($package)->{EventedProperties} ||= {};
+    my $store = _prop_store($package);
     $store->{properties}{$property} = \%opts;
     
     return 1;
+}
+
+# add the default set callback if not already existing.
+# perhaps one day when there are subroutine callbacks, this could be injected into
+# the Evented::Object smybol table so it does not have to be reproduced over and over.
+sub add_default_set_callback {
+    my $eo = shift;
+    return if $eo->{$props}{eventedProperties}{has_set_cb};
+    $eo->register_callback(set => \&_default_callback,
+        name     => 'evented.properties.set',
+        priority => 1000 # it's kinda important to set value first
+    );
+    $eo->{$props}{eventedProperties}{has_set_cb} = 1;
+}
+
+# default set callback.
+sub  _default_callback { &__default_callback }
+sub __default_callback {
+    my ($fire, $prop_name, $old, $new) = @_;
+    $fire->{new} = $new;
+}
+
+#################
+### TIE MAGIC ###
+#################
+
+# create a new tie.
+sub TIESCALAR {
+    my ($class, $property, $eo) = @_;
+    my $prop = bless {
+        name  => $property,
+        value => undef,
+        eo    => $eo
+    }, __PACKAGE__;
+    weaken($prop->{eo});
+    return $prop;
+}
+
+# fetch the value.
+# I don't see a reason, at least currently, to fire these as events. perhaps there should
+# be an option to enable such events with the possibility to modify what is returned.
+# hmm, maybe. this could be a cool evented tie type of deal.
+sub FETCH {
+    my $prop = shift;
+    return $prop->{value};
+}
+
+sub STORE {
+    my ($prop, $new) = @_;
+    my $old = $prop->{value};
+    
+    # if an evented object is associated, fire the set events,
+    # and use the ->{new} value.
+    if (blessed $prop->{eo} && $prop->{eo}->isa('Evented::Object')) {
+        my $fire = $prop->{eo}->fire_events_together(
+            [ "set_$$prop{name}" =>                $old, $new ],
+            [ set                => $prop->{name}, $old, $new ]
+        );
+        return $prop->{value} = $fire->{new};
+    }
+    
+    # otherwise, fall back to just assigning directly.
+    return $prop->{value} = $new;
+    
 }
 
 1;
