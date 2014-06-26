@@ -21,7 +21,7 @@ use Scalar::Util qw(weaken blessed);
 use Evented::Object;
 use Evented::Object::Hax 'export_code';
 
-our $VERSION = '0.40';
+our $VERSION = '0.41';
 our $props   = $Evented::Object::props;
 
 # Evented::Properties import subroutine.
@@ -34,11 +34,13 @@ sub import {
     $store->{desired} = \@opts;
     
     # determine properties.
+    # ex: use Evented::Properties qw(some_prop some_other), [my_prop => 'ro']
+    # maybe I should do something like
+    # ex: use Evented::Properties qw(some_prop some_other:ro)
     my (%props, $last_thing);
     foreach my $thing (@opts) {
-        if (ref $thing && ref $thing eq 'HASH') { $props{$last_thing} = $thing }
-        else                                    { $props{$thing}      = {}     }
-        $last_thing = $thing;
+        if    (!ref $thing)            { $props{ $thing      } = []                   }
+        elsif ( ref $thing eq 'ARRAY') { $props{ $thing->[0] } = @$thing[1..$#$thing] }
     }
     
     # add each property.
@@ -53,7 +55,7 @@ sub _prop_store { Evented::Object::_package_store(shift)->{EventedProperties} ||
 # called by the anonymous lvalue subroutines.
 sub get_lvalue : lvalue {
     my ($property, $eo) = @_;
-    add_default_set_callback($eo);
+    add_default_callbacks($eo);
     my $r = \($eo->{$props}{eventedProperties}{properties}{$property} //= undef);
     tie $$r, __PACKAGE__, $property, $eo if not tied $$r;
     return $$r;
@@ -77,21 +79,43 @@ sub add_property {
 # add the default set callback if not already existing.
 # perhaps one day when there are subroutine callbacks, this could be injected into
 # the Evented::Object smybol table so it does not have to be reproduced over and over.
-sub add_default_set_callback {
+sub add_default_callbacks {
     my $eo = shift;
-    return if $eo->{$props}{eventedProperties}{has_set_cb};
-    $eo->register_callback(set => \&_default_callback,
-        name     => 'evented.properties.set',
-        priority => 1000 # it's kinda important to set value first
-    );
-    $eo->{$props}{eventedProperties}{has_set_cb} = 1;
+    
+    # default setter callback.
+    if (!$eo->{$props}{eventedProperties}{has_set_cb}) {
+        $eo->register_callback(set => \&_default_set_callback,
+            name     => 'evented.properties.set',
+            priority => 1000 # it's kinda important to set value first
+        );
+        $eo->{$props}{eventedProperties}{has_set_cb} = 1;
+    }
+    
+    # default getter callback.
+    if (!$eo->{$props}{eventedProperties}{has_get_cb}) {
+        $eo->register_callback(get => \&_default_get_callback,
+            name     => 'evented.properties.get',
+            priority => 1000 # it's kinda important to fetch value first
+        );
+        $eo->{$props}{eventedProperties}{has_get_cb} = 1;
+    }
+    
+    return 1;
 }
 
+sub _default_set_callback { &__default_set_callback }
+sub _default_get_callback { &__default_get_callback }
+
 # default set callback.
-sub  _default_callback { &__default_callback }
-sub __default_callback {
+sub __default_set_callback {
     my ($fire, $prop_name, $old, $new) = @_;
     $fire->{new} = $new;
+}
+
+# default get callback.
+sub __default_get_callback {
+    my ($fire, $prop_name, $value) = @_;
+    $fire->{value} = $value;
 }
 
 #################
@@ -111,14 +135,25 @@ sub TIESCALAR {
 }
 
 # fetch the value.
-# I don't see a reason, at least currently, to fire these as events. perhaps there should
-# be an option to enable such events with the possibility to modify what is returned.
-# hmm, maybe. this could be a cool evented tie type of deal.
 sub FETCH {
     my $prop = shift;
+    
+    # if an evented object is associated, fire the get events,
+    # and use the ->{value} value.
+    if (blessed $prop->{eo} && $prop->{eo}->isa('Evented::Object')) {
+        my $fire = $prop->{eo}->fire_events_together(
+            [ "get_$$prop{name}" =>                $prop->{value} ],
+            [ get                => $prop->{name}, $prop->{value} ]
+        );
+        return $fire->{value};
+    }
+    
+    # otherwise, fall back to the actual value.
     return $prop->{value};
+    
 }
 
+# store a value.
 sub STORE {
     my ($prop, $new) = @_;
     my $old = $prop->{value};
